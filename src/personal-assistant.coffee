@@ -15,17 +15,16 @@ PAFactory = (options) ->
     pas = {}
     rootPa = null
 
-    heartbeatInterval = options.heartbeatInterval or 60 * 1000
+    heartbeatInterval = options.heartbeatInterval or 10 * 1000
     redisPub = options.redisPub
     redisSub = options.redisSub
     redisClient = options.redisClient
 
     handleUpdates = options.handleUpdates or false
-    handleCleanup = options.handleCleanup or false
 
     maxChunkSize = options.maxChunkSize or MAX_CHUNK_SIZE
 
-    if handleUpdates or handleCleanup
+    if handleUpdates
         pusher = options.pusherClient or new Pusher options.pusher
 
     ###*
@@ -77,15 +76,12 @@ PAFactory = (options) ->
             ###
                 We set up the following keys in redis
                 pa:query:namespace:`qryId`               - the data for the queryId - { result, qryName, qry, version }
-                pa:qryIds:namespace                      - all query Ids
                 pa:qryIds:namespace:`qryName`            - a set of queryIds for the given queryname
                 pa:latestQueryVersion                    - a key holding the latest query version (to use when
                                                            determining whether a query result should be updated)
             ###
             @qryIdKeyPref = "pa:query:"
             if namespace then @qryIdKeyPref += namespace + ":"
-            @allQryIdsKey = "pa:qryIds"
-            if namespace then @allQryIdsKey += ":" + namespace
             @qryNameListKeyPref = "pa:qryIds:"
             if namespace then @qryNameListKeyPref += namespace + ":"
 
@@ -97,6 +93,8 @@ PAFactory = (options) ->
                 redisSub.subscribe channel
                 redisSub.on "message", (_channel, message) =>
                     if _channel is channel then @maybeModifiedQueryMsgReceived message
+
+                setInterval @_keepSocketAlive.bind(@), heartbeatInterval
 
         ### API BITS ###
         query: (qryName, data, initialProps, callback) ->
@@ -171,7 +169,6 @@ PAFactory = (options) ->
 
         maybeModifiedQueryMsgReceived: (message) ->
             { qryName, version } = JSON.parse message
-
             # Get all queryIds from the queryname
             promise = Q.ninvoke redisClient, 'smembers', @qryNameListKeyPref + qryName
             promise.then (qryIds) =>
@@ -189,13 +186,14 @@ PAFactory = (options) ->
             qry = {
                 version
                 qryId
+                qryName
             }
 
             @runQuery qry, (err, qry) ->
                 if err then return callback err
 
                 # If the query has been modified then notify pusher that it has happened
-                if qry.modified
+                if qry?.modified
                     pusher.trigger "query-#{qry.qryId}", 'modified query', qry.result
 
          _extendQuery: (extender, qryId, qry) ->
@@ -211,6 +209,8 @@ PAFactory = (options) ->
 
         runQuery: (qry, callback) ->
 
+            haveOrigQry = qry.qry?
+
             # Go and see if there is an existing query
             qrypromise = Q.fcall =>
                 unless qry.qryId 
@@ -225,12 +225,26 @@ PAFactory = (options) ->
             qrypromise = qrypromise.then => 
                 Q.ninvoke redisClient, 'hgetall', @qryIdKeyPref + qry.qryId
             qrypromise = qrypromise.then (existing) =>
-                existing or= {}
+                unless existing
+                    existing = {}
+
+                    # If we don't have an existing query then make sure its not in the set for the
+                    # qryName by doing an SREM... (it will be put back in later if needed)
+                    if qry.qryName then redisClient.srem @qryNameListKeyPref + qry.qryName, qry.qryId
+
+                # If we don't have an existing query and no actual query object (as could be the case
+                # when doing a maybeModifiedQueries) then we dont want to continue any further. Callback
+                # and exit
+                unless qry.qry or existing.qry
+                    return callback()
 
                 _version = existing.version or null
-                existingQry = existing.result or null
+                existingQry = if existing.result then JSON.parse existing.result else null
 
                 if existing.qryName then qry.qryName = existing.qryName 
+
+                # TODO: should probably do some checking that the existing qry matches
+                # the input one if applicable
                 if existing.qry then qry.qry = JSON.parse existing.qry
 
                 # Store the handler
@@ -255,7 +269,7 @@ PAFactory = (options) ->
                     # equal to the version we are after then just return a promise
                     # with that value (we need to convert it to JSON though)
                     if existingQry? and (qry.version and qry.version <= _version)
-                        qrypromise = Q.fcall -> JSON.parse existingQry
+                        qrypromise = Q.resolve existingQry
                     else
                         qrypromise = Q.nfcall qry.handler, qry
                     return qrypromise
@@ -279,9 +293,23 @@ PAFactory = (options) ->
                                 version: String _version
                                 session: JSON.stringify qry.session
                             }
-                            promise = Q.ninvoke redisClient, 'hmset', @qryIdKeyPref + qry.qryId, qryData
+                            qryIdKey =  @qryIdKeyPref + qry.qryId
+                            promise = Q.ninvoke redisClient, 'hmset', qryIdKey, qryData
+
+                            # If this is no TTL on this query then add one. Do this completely async since
+                            # it shouldn't hold up getting the data out to the user
+                            redisClient.ttl qryIdKey, (err, ttl) ->
+                                if err then return winston.error err.stack, err
+                                # If no timeout set or we've been passed in an original query then set an expires
+                                # (the ttl check is more there as safety since the only way the ttl shouldnt exist
+                                # is if we have an original query anyway)
+                                if ttl is -1 or haveOrigQry
+                                    # -1 indicates no timeout set. So set one to 2.5 times the heartbeat interval
+                                    # (which is the interval that we check )
+                                    redisClient.pexpire qryIdKey, 2.5 * heartbeatInterval
+
                             promise = promise.then => 
-                                Q.ninvoke redisClient, 'sadd', @qryNameListKeyPref + qry.qryName, qry.qryId
+                                return Q.ninvoke redisClient, 'sadd', @qryNameListKeyPref + qry.qryName, qry.qryId
 
                             return promise
                     else
@@ -297,6 +325,23 @@ PAFactory = (options) ->
             qrypromise.fail (err) ->
                 winston.error err.stack
                 return callback err
+
+        _keepSocketAlive: ->
+
+            getQryFromChannel = (channelName) ->
+                return channelName[6..] # query-#{qryId}
+
+            # Get all the active channels from pusher and reset the expires value
+            # on the related queries
+            pusher.get { path: '/channels' }, (err, req, res) =>
+                if err then return winston.warn err
+                if res.statusCode is 200
+                    result = JSON.parse res.body
+                    channels = result.channels
+                    for channelName, val of channels
+                        qryId = getQryFromChannel channelName
+                        # Set the expiry time - 1.5 heartbeats
+                        redisClient.pexpire @qryIdKeyPref + qryId, 1.5 * heartbeatInterval
 
     PAConstructor = (namespace) ->
         # Return either the existing PA for this namespace or create

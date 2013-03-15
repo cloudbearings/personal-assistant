@@ -1,7 +1,14 @@
 redis = require 'redis'
 {PAFactory} = require '../'
+Q = require 'q'
+winston = require 'winston'
 
-module.exports.newPaFactory = (update, cleanup) ->
+# Remove winston console logging
+winston.remove winston.transports.Console
+
+rClient = redis.createClient()
+
+module.exports.newPaFactory = (update) ->
     redisPub = redis.createClient()
     redisSub = redis.createClient()
     redisClient = redis.createClient()
@@ -10,8 +17,7 @@ module.exports.newPaFactory = (update, cleanup) ->
         redisSub,
         redisClient,
         handleUpdates: update
-        handleCleanup: cleanup
-        Pusher
+        pusherClient: Pusher
     }
 
     factory = PAFactory opts
@@ -29,4 +35,17 @@ module.exports.dummyQueryHandlerError = (qry, callback) ->
 module.exports.dummyQueryUniqifierError = (qry) ->
     throw new Error 'unique error'
 
-Pusher = {}
+module.exports.cleanupKeys = (pa, callback) ->
+    ns = pa.namespace
+    promise = Q.ninvoke rClient, 'keys', "pa:query:#{ns}:*"
+    promise = promise.then (keys) -> if keys.length then Q.ninvoke rClient, 'del', keys... else Q.resolve()
+    promise = promise.then -> Q.ninvoke rClient, 'keys', "pa:qryIds:#{ns}:*"
+    promise = promise.then (keys) -> if keys.length then Q.ninvoke rClient, 'del', keys... else Q.resolve()
+    promise.then -> callback()
+    promise.fail (err) -> callback(err)
+
+
+module.exports.Pusher = Pusher = {
+    trigger: ->
+}
+

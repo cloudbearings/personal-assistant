@@ -5,12 +5,15 @@ describe 'querying', ->
     pa = null
     before ->
         factory = setup.newPaFactory()
-        pa = factory('/ns')
+        pa = factory('test/ns')
         pa.setQueryHandler 'testquery', setup.dummyQueryHandler
         pa.setQueryUniqifier 'testquery', setup.dummyQueryUniqifier
         pa.setQueryHandler 'errorquery', setup.dummyQueryHandlerError
         pa.setQueryUniqifier 'errorquery', setup.dummyQueryUniqifier
         pa.setQueryUniqifier 'erroruniqifying', setup.dummyQueryUniqifierError
+
+    afterEach (done) ->
+        setup.cleanupKeys(pa, done)
 
     it 'should be possible to perform a query', (done) ->
         pa.query 'testquery', {test: 'data'}, (err, qryId, response) ->
@@ -42,12 +45,15 @@ describe 'extending', ->
     qryId = null
     before (done) ->
         factory = setup.newPaFactory()
-        pa = factory('/ns')
+        pa = factory('test/ns')
         pa.setQueryHandler 'testquery', setup.dummyQueryHandler
         pa.setQueryUniqifier 'testquery', setup.dummyQueryUniqifier
         pa.query 'testquery', {test : 'data'}, (err, _qryId, response) ->
             qryId = _qryId
             done()
+
+    afterEach (done) ->
+        setup.cleanupKeys(pa, done)
 
     it 'should be possible to extend a query', (done) ->
         pa.setQueryExtender 'testquery', (existingQry, toExtend, callback) ->
@@ -61,7 +67,6 @@ describe 'extending', ->
             qry.qry.should.eql {test: 'data', more: 'data'}
             callback null, 'extended response'
 
-
         pa.extendQuery 'testquery', qryId, {more: 'data'}, (err, extendedId, result) ->
             result.should.eql 'extended response'
             extendedId.should.eql 'more'
@@ -71,7 +76,7 @@ describe 'middleware', ->
     pa = null
     before ->
         factory = setup.newPaFactory()
-        pa = factory('/ns')
+        pa = factory('test/ns')
 
     it 'should be called before the query', (done) ->
         pa.setQueryUniqifier 'testquery', setup.dummyQueryUniqifier
@@ -105,4 +110,36 @@ describe 'middleware', ->
 
 describe 'updates', ->
 
-describe 'cleanup', ->
+    pa = null
+    pusher = setup.Pusher
+    before ->
+        factory = setup.newPaFactory(true)
+        pa = factory('test/update')
+
+    afterEach (done) ->
+        setup.cleanupKeys(pa, done)
+
+    it 'should call into pusher if the query changes', (done) ->
+        pa.setQueryUniqifier 'updateqry', setup.dummyQueryUniqifier
+        pa.setQueryHandler 'updateqry', setup.dummyQueryHandler
+        pa.query 'updateqry', {test: 'update'}, (err, qryId, response) ->
+            pusher.trigger = (channel, event, data) ->
+                channel.should.eql "query-#{qryId}"
+                event.should.eql 'modified query'
+                data.should.eql 'updated'
+                done()
+
+            pa.setQueryHandler 'updateqry', (qry, callback) ->
+                callback null, 'updated'
+
+            pa.maybeModifiedQuery 'updateqry'
+
+    it 'should not call into pusher if the query doesnt change', (done) ->
+        pa.setQueryUniqifier 'updateqry', setup.dummyQueryUniqifier
+        pa.setQueryHandler 'updateqry', setup.dummyQueryHandler
+        pa.query 'updateqry', {test: 'update'}, (err, qryId, response) ->
+            pusher.trigger = (channel, event, data) ->
+                done new Error 'shouldnt have called trigger'
+
+            pa.maybeModifiedQuery 'updateqry'
+            setTimeout done, 500
