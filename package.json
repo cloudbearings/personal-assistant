@@ -1,6 +1,6 @@
 {
   "name": "personal-assistant",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "A distributed websocket based mechanism for managing queries and pushing updates when those queries change",
   "main": "index.js",
   "scripts": {

@@ -15,7 +15,7 @@ PAFactory = (options) ->
     pas = {}
     rootPa = null
 
-    heartbeatInterval = options.heartbeatInterval or 10 * 1000
+    heartbeatInterval = options.heartbeatInterval or 60 * 60 * 1000 # 1 hr
     redisPub = options.redisPub
     redisSub = options.redisSub
     redisClient = options.redisClient
