@@ -20,6 +20,8 @@ PAFactory = (options) ->
     redisSub = options.redisSub
     redisClient = options.redisClient
 
+    identifier = options.identifier
+
     handleUpdates = options.handleUpdates or false
 
     maxChunkSize = options.maxChunkSize or MAX_CHUNK_SIZE
@@ -194,7 +196,11 @@ PAFactory = (options) ->
 
                 # If the query has been modified then notify pusher that it has happened
                 if qry?.modified
-                    pusher.trigger "query-#{qry.qryId}", 'modified query', qry.result
+                    channelName = ""
+                    if identifier
+                        channelName += identifier + '-'
+                    channelName += "query-#{qry.qryId}"
+                    pusher.trigger channelName, 'modified query', qry.result
 
          _extendQuery: (extender, qryId, qry) ->
             unless extender then return Q.fcall -> throw new Error "No extender for " + qryId
