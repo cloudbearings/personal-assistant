@@ -130,11 +130,11 @@ PAFactory = (options) ->
             promise.fail (err) ->
                 callback err
 
-        maybeModifiedQuery: (qryName) ->
+        maybeModifiedQuery: (qryName, socketId) ->
             channel = "maybeModifiedQuery" + if @namespace then ":" + @namespace else ""
             redisClient.incr @latestQueryVersionKey, (err, version) ->
                 if err then return winston.log err
-                redisPub.publish channel, JSON.stringify { qryName, version }
+                redisPub.publish channel, JSON.stringify { qryName, version, socketId }
 
         setQueryUniqifier: (qryName, uniqifierFn, regex) ->
             opts = @queryHandlers[qryName] or= {}
@@ -170,7 +170,7 @@ PAFactory = (options) ->
             return handler
 
         maybeModifiedQueryMsgReceived: (message) ->
-            { qryName, version } = JSON.parse message
+            { qryName, version, socketId } = JSON.parse message
             # Get all queryIds from the queryname
             promise = Q.ninvoke redisClient, 'smembers', @qryNameListKeyPref + qryName
             promise.then (qryIds) =>
@@ -178,12 +178,12 @@ PAFactory = (options) ->
                 # tasks so that we dont KO the server at 100% CPU. Use async.queue
                 # which seems to do what we want
                 recheckQ = async.queue(((qryId, callback) =>
-                    @recheckQuery qryId, qryName, version, callback
+                    @recheckQuery qryId, qryName, version, socketId, callback
                 ), maxChunkSize)
                 recheckQ.push qryIds, (err) ->
                     winston.error err.stack, err
 
-        recheckQuery: (qryId, qryName, version, callback) ->
+        recheckQuery: (qryId, qryName, version, socketId, callback) ->
             # Construct the qry object
             qry = {
                 version
@@ -200,7 +200,7 @@ PAFactory = (options) ->
                     if identifier
                         channelName += identifier + '-'
                     channelName += "query-#{qry.qryId}"
-                    pusher.trigger channelName, 'modified query', qry.result
+                    pusher.trigger channelName, 'modified query', qry.result, socketId
 
          _extendQuery: (extender, qryId, qry) ->
             unless extender then return Q.fcall -> throw new Error "No extender for " + qryId
