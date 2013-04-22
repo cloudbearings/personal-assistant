@@ -26,8 +26,7 @@ PAFactory = (options) ->
 
     maxChunkSize = options.maxChunkSize or MAX_CHUNK_SIZE
 
-    if handleUpdates
-        pusher = options.pusherClient or new Pusher options.pusher
+    pusher = options.pusherClient or new Pusher options.pusher
 
     ###*
      * API:
@@ -78,12 +77,15 @@ PAFactory = (options) ->
             ###
                 We set up the following keys in redis
                 pa:query:namespace:`qryId`               - the data for the queryId - { result, qryName, qry, version }
+                pa:socket:namespace:`socketId`           - a set of queryIds for the given socket
                 pa:qryIds:namespace:`qryName`            - a set of queryIds for the given queryname
                 pa:latestQueryVersion                    - a key holding the latest query version (to use when
                                                            determining whether a query result should be updated)
             ###
             @qryIdKeyPref = "pa:query:"
             if namespace then @qryIdKeyPref += namespace + ":"
+            @socketIdKeyPref = "pa:socket:"
+            if namespace then @socketIdKeyPref += namespace + ":"
             @qryNameListKeyPref = "pa:qryIds:"
             if namespace then @qryNameListKeyPref += namespace + ":"
 
@@ -130,11 +132,21 @@ PAFactory = (options) ->
             promise.fail (err) ->
                 callback err
 
-        maybeModifiedQuery: (qryName, socketId) ->
+        maybeModifiedQuery: (qryName, socketId, noSelfNotify) ->
             channel = "maybeModifiedQuery" + if @namespace then ":" + @namespace else ""
-            redisClient.incr @latestQueryVersionKey, (err, version) ->
+            redisClient.incr @latestQueryVersionKey, (err, version) =>
                 if err then return winston.log err
-                redisPub.publish channel, JSON.stringify { qryName, version, socketId }
+
+                # If we have the socketId and should be self notifying then run all the self notification
+                # stuff now. If we aren't self notifying then just pass the socketId through
+                if noSelfNotify
+                    redisPub.publish channel, JSON.stringify { qryName, version, socketId }
+                else
+                    redisPub.publish channel, JSON.stringify { qryName, version }
+                    # Self notify if we have a socket id
+                    if socketId
+                        @notifySingleSocket qryName, socketId, version
+
 
         setQueryUniqifier: (qryName, uniqifierFn, regex) ->
             opts = @queryHandlers[qryName] or= {}
@@ -181,7 +193,7 @@ PAFactory = (options) ->
                     @recheckQuery qryId, qryName, version, socketId, callback
                 ), maxChunkSize)
                 recheckQ.push qryIds, (err) ->
-                    winston.error err.stack, err
+                    if err then winston.error err.stack, err
 
         recheckQuery: (qryId, qryName, version, socketId, callback) ->
             # Construct the qry object
@@ -201,6 +213,7 @@ PAFactory = (options) ->
                         channelName += identifier + '-'
                     channelName += "query-#{qry.qryId}"
                     pusher.trigger channelName, 'modified query', qry.result, socketId
+                callback()
 
          _extendQuery: (extender, qryId, qry) ->
             unless extender then return Q.fcall -> throw new Error "No extender for " + qryId
@@ -315,7 +328,23 @@ PAFactory = (options) ->
                                     redisClient.pexpire qryIdKey, 2.5 * heartbeatInterval
 
                             promise = promise.then => 
-                                return Q.ninvoke redisClient, 'sadd', @qryNameListKeyPref + qry.qryName, qry.qryId
+                                promiseA = Q.ninvoke redisClient, 'sadd', @qryNameListKeyPref + qry.qryName, qry.qryId
+
+                                # Store off the link from the socketId to the query...
+                                if qry.socketId
+                                    socketIdKey = @socketIdKeyPref + qry.socketId
+                                    sockData = JSON.stringify {qryId: qry.qryId, qryName: qry.qryName}
+                                    promiseB = Q.ninvoke redisClient, 'sadd', socketIdKey, sockData
+
+                                    # Maybe set the ttl on the socketId key. Same as for the qryId key above
+                                    redisClient.ttl socketIdKey, (err, ttl) ->
+                                        if err then return winston.error err.stack, err
+                                        if ttl is -1 then redisClient.pexpire socketIdKey, 2.5 * heartbeatInterval
+                                        return
+                                else
+                                    promiseB = Q.resolve()
+
+                                return Q.all [promiseA, promiseB]
 
                             return promise
                     else
@@ -332,14 +361,41 @@ PAFactory = (options) ->
                 winston.error err.stack
                 return callback err
 
+        notifySingleSocket: (qryName, socketId, version) ->
+            # Get all the queries for the socket and then uncover the ones
+            # we want for the given query name
+            promise = Q.ninvoke redisClient, 'smembers', @socketIdKeyPref + socketId
+            promise = promise.then (qryObjStrs) =>
+                qryObjs = _.map qryObjStrs, (str) ->
+                    return JSON.parse str
+
+                cb = (err) ->
+                    if err then winston.error err.stack, err
+                    return
+
+                # Recheck any queries that have the correct query name
+                for obj in qryObjs
+                    if obj.qryName is qryName
+                        @recheckQuery obj.qryId, qryName, version, undefined, cb
+
+            return promise
+                
+
         _keepSocketAlive: ->
 
-            getQryFromChannel = (channelName) ->
-                return channelName[6..] # query-#{qryId}
+            channelOffset = identifier.length
+            qryOffset = channelOffset + 7 # <identifier>-query-<qryId>
+            socketOffset = channelOffset + 8 # <identifier>-socket-<socketId>
 
-            # Get all the active channels from pusher and reset the expires value
+            getQryFromChannel = (channelName) ->
+                return channelName[qryOffset..]
+
+            getSocketFromChannel = (channelName) ->
+                return channelName[socketOffset..]
+
+            # Get all the active query channels from pusher and reset the expires value
             # on the related queries
-            pusher.get { path: '/channels' }, (err, req, res) =>
+            pusher.get { path: '/channels', params: {filter_by_prefix: "#{identifier}-query-"} }, (err, req, res) =>
                 if err then return winston.warn err
                 if res.statusCode is 200
                     result = JSON.parse res.body
@@ -348,6 +404,18 @@ PAFactory = (options) ->
                         qryId = getQryFromChannel channelName
                         # Set the expiry time - 1.5 heartbeats
                         redisClient.pexpire @qryIdKeyPref + qryId, 1.5 * heartbeatInterval
+
+            # Get all the active sockets from pusher and reset the expires value
+            pusher.get { path: '/channels', params: {filter_by_prefix: "#{identifier}-socket-"} }, (err, req, res) =>
+                if err then return winston.warn err
+                if res.statusCode is 200
+                    result = JSON.parse res.body
+                    channels = result.channels
+                    for channelName, val of channels
+                        sockId = getSocketFromChannel channelName
+                        # Set the expiry time - 1.5 heartbeats
+                        redisClient.pexpire @sockIdKeyPref + sockId, 1.5 * heartbeatInterval
+
 
     PAConstructor = (namespace) ->
         # Return either the existing PA for this namespace or create
