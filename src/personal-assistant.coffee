@@ -3,6 +3,7 @@ Q = require 'q'
 winston = require 'winston'
 Pusher = require 'pusher'
 _ = require 'underscore'
+util = require 'util'
 
 
 MAX_CHUNK_SIZE = 50
@@ -103,22 +104,45 @@ PAFactory = (options) ->
         ### API BITS ###
         query: (qryName, data, initialProps, callback) ->
 
+            # We allow bulk performing of queries. In this case the qryName
+            # will be an object of the form {qryName: data}
+            if typeof qryName is 'object'
+                callback = initialProps
+                initialProps = data
+                qryData = qryName
+                qryName = undefined
+                data = undefined
+                multiFormat = true
+            else
+                qryData = {}
+                qryData[qryName] = data
+                multiFormat = false
+
+
             if typeof initialProps is 'function'
                 callback = initialProps
                 initialProps = null
 
             initialProps or= {}
 
-            _qry = {
-                qryName
-                qry: data
+            qry = {
+                qryData
             }
 
-            qry = _.extend {}, initialProps, _qry
+            externalProps = _.extend {}, initialProps
 
-            @runQuery qry, (err, qry) ->
-                if err then return callback err
-                callback? null, qry.qryId, qry.result
+            @runQuery qry, externalProps, (err, result) ->
+                if err then return callback? err
+                # If we only have one result the transform the results
+                qryIds = _.keys result
+                if qryIds.length is 1 and not multiFormat
+                    qryId = qryIds[0]
+                    callback? null, qryId, result[qryId].result
+                else
+                    resultObj = {}
+                    for qryId, res of result
+                        resultObj[qryId] = res.result
+                    callback? null, resultObj
 
         extendQuery: (qryName, qryId, data, initialProps, callback) ->
             if typeof initialProps is 'function'
@@ -203,16 +227,18 @@ PAFactory = (options) ->
                 qryName
             }
 
-            @runQuery qry, (err, qry) ->
+            @runQuery qry, (err, resultObj) ->
                 if err then return callback err
 
                 # If the query has been modified then notify pusher that it has happened
-                if qry?.modified
-                    channelName = ""
-                    if identifier
-                        channelName += identifier + '-'
-                    channelName += "query-#{qry.qryId}"
-                    pusher.trigger channelName, 'modified query', qry.result, socketId
+                for qryId, resultData of resultObj
+                    {modified, result} = resultData
+                    if modified
+                        channelName = ""
+                        if identifier
+                            channelName += identifier + '-'
+                        channelName += "query-#{qryId}"
+                        pusher.trigger channelName, 'modified query', result, socketId
                 callback()
 
          _extendQuery: (extender, qryId, qry) ->
@@ -226,135 +252,346 @@ PAFactory = (options) ->
                 return Q.nfcall extender, existingQry, qry
             return promise
 
-        runQuery: (qry, callback) ->
+        # qryData is an object mapping query names
+        # to query objects
+        _getQryIdsForQuery: (externalProps, qryData) ->
+            qryIdToNameMap = {}
+            qryIdToQryMap = {}
+            allIds = []
+            for qryName, qry of qryData
+                handler = @getHandler('uniqifier', qryName)
 
-            haveOrigQry = qry.qry?
+                unless handler? then throw new Error "Couldnt find a uniqifier for query name: #{qryName}"
 
-            # Go and see if there is an existing query
-            qrypromise = Q.fcall =>
-                unless qry.qryId 
-                    if qry.uniqifier
-                        qry.qryId = qry.uniqifier qry
-                    else
-                        qry.qryId = @getHandler('uniqifier', qry.qryName)? qry
+                _ids = handler externalProps, qry
 
-                unless qry.qryId then return callback new Error "Couldnt get a query id"
-                return
+                unless _ids? then throw new Error "Couldnt get query id(s)"
 
-            qrypromise = qrypromise.then => 
-                Q.ninvoke redisClient, 'hgetall', @qryIdKeyPref + qry.qryId
-            qrypromise = qrypromise.then (existing) =>
+                # The uniqifier could return multiple ids or a single one. We handle both here
+                if Array.isArray _ids
+                    # Lets just do some consistency checking...
+                    unless Array.isArray(qry) and _ids.length is qry.length
+                        throw new Error "The uniqifier has indicated multiple queries but they don't match up with the qry data passed in: #{utils.inspect qry}"
+                    _ids.forEach (id, index) ->
+                        qryIdToQryMap[id] = qry[index]
+                        qryIdToNameMap[id] = qryName
+                        allIds.push id
+                else
+                    qryIdToNameMap[_ids] = qryName
+                    qryIdToQryMap[_ids] = qry
+                    allIds.push _ids
+
+            return {
+                qryIdToNameMap
+                qryIdToQryMap
+                qryIdToResultMap: {}
+                qryIdToExistingResultMap: {}
+
+                allIds
+            }
+
+        # qryIdData is an object with keys of qryName and vals of the qryIds
+        _getHandlersForQryIds: (qryIdData) ->
+            knownHandlers = []
+            handlerQryIdMap = []
+            # We cant use functions as keys of an object so lets stick them
+            # in an array and use the index as the key to map to the list of qryIds
+            # for that handler
+            for qryName, qryIds of qryIdData
+                handler = @getHandler 'handler', qryName
+                unless handler then throw new Error "Can't get handler for query name: #{qryName}"
+
+                # Do we know about the handler?
+                handlerId = knownHandlers.indexOf handler
+                if handlerId isnt -1
+                    ids = handlerQryIdMap[handlerId]
+                    for id in qryIds
+                        if id not in ids then ids.push id
+                else
+                    knownHandlers.push handler
+                    handlerId = knownHandlers.indexOf handler
+                    handlerQryIdMap[handlerId] = qryIds[..]
+
+            return {
+                handlers: knownHandlers
+                qryIdsMap: handlerQryIdMap
+            }
+
+        # Do initial setup getting and mapping ids etc.
+        _initializeQueryProps: (qry, externalProps) ->
+            # There are two input options here - we've either been passed queryData
+            # in which case we are doing a new query or we've been passed a queryName and qryId
+            # in which case we are repeating an existing query.
+            if qry.qryData
+                qry.qryIdData = @_getQryIdsForQuery externalProps, qry.qryData
+            else
+                unless qry.qryId? 
+                    throw new Error "Not enough data to construct query - #{util.inspect qry}"
+                qry.qryIdData = {
+                    qryIdToNameMap: {}
+                    qryIdToQryMap: {}
+                    qryIdToResultMap: {}
+                    qryIdToExistingResultMap: {}
+
+                    allIds: [qry.qryId]
+                }
+                if qry.qryName?
+                    qry.qryIdData.qryIdToNameMap[qry.qryId] = [qry.qryName]
+            return
+
+        _findExistingQueries: (qryIds) ->
+            promises = []
+            for qryId in qryIds
+                promises.push Q.ninvoke redisClient, 'hgetall', @qryIdKeyPref + qryId
+
+            # Wait for all promises to complete
+            return Q.all promises
+
+        _removeQryIdFromData: (data, qryId) ->
+            delete data.qryIdToNameMap[qryId]
+            delete data.qryIdToQryMap[qryId]
+            delete data.qryIdToResultMap[qryId]
+            delete data.qryIdToExistingResultMap[qryId]
+            data.allIds = _.without data.allIds, qryId
+            return
+
+        # Loop through all the existing queries and 
+        # 1. If we haven't already got data for the query build it from
+        #    the existing option
+        # 2. If we do have data for the query then check that it matches
+        #    the existing data.
+        #    
+        _buildAndCheckQueryFromExisting: (qryIdData, existingObjs, version) ->
+            existingQueries = []
+            existingObjs.forEach (existing, index) =>
+                qryId = qryIdData.allIds[index]
+                qryName = qryIdData.qryIdToNameMap[qryId]
                 unless existing
                     existing = {}
 
                     # If we don't have an existing query then make sure its not in the set for the
                     # qryName by doing an SREM... (it will be put back in later if needed)
-                    if qry.qryName then redisClient.srem @qryNameListKeyPref + qry.qryName, qry.qryId
+                    if qryName then redisClient.srem @qryNameListKeyPref + qryName, qryId
 
                 # If we don't have an existing query and no actual query object (as could be the case
-                # when doing a maybeModifiedQueries) then we dont want to continue any further. Callback
-                # and exit
-                unless qry.qry or existing.qry
-                    return callback()
+                # when doing a maybeModifiedQueries) then we dont want to continue any further. Return
+                unless qryIdData.qryIdToQryMap[qryId] or existing.qry
+                    @_removeQryIdFromData qryIdData, qryId
+                    return
 
                 _version = existing.version or null
-                existingQry = if existing.result then JSON.parse existing.result else null
-
-                if existing.qryName then qry.qryName = existing.qryName 
-
-                # TODO: should probably do some checking that the existing qry matches
-                # the input one if applicable
-                if existing.qry then qry.qry = JSON.parse existing.qry
-
-                # Store the handler
-                unless qry.handler
-                    qry.handler = @getHandler 'handler', qry.qryName
-
-                unless qry.handler then return callback new Error "Couldn't get a handler for the query with name: #{qry.qryName}"
-
-                qry.session = if existing.session then  JSON.parse existing.session else {}
+                existingResult = if existing.result then JSON.parse existing.result else null
                 
-                mwPromises = []
-                middleware = []
-                middleware.push globalMiddleware..., @middleware...
-                middleware.forEach (mw) ->
-                    mwPromises.push Q.nfcall mw, qry
+                qryIdData.qryIdToExistingResultMap[qryId] = existingResult
 
-                # Now run through all the middleware
-                promise = Q.all mwPromises
+                if version? and _version? and version <= _version
+                    qryIdData.qryIdToResultMap[qryId] = existingResult
 
-                promise = promise.then ->
-                    # If we have an existing query which is at a version greater than or
-                    # equal to the version we are after then just return a promise
-                    # with that value (we need to convert it to JSON though)
-                    if existingQry? and (qry.version and qry.version <= _version)
-                        qrypromise = Q.resolve existingQry
-                    else
-                        qrypromise = Q.nfcall qry.handler, qry
-                    return qrypromise
+                # If we have a query name check that this matches
+                if qryName and existing.qryName
+                    if String(qryName) isnt String existing.qryName 
+                        # The query names don't match. Don't know how to continue - throw
+                        # an error
+                        throw new Error "Query names don't match for qryId: #{qryId}. Expected #{qryName} but got #{existing.qryName}"
+                else if existing.qryName
+                    qryName = existing.qryName
+                    qryIdData.qryIdToNameMap[qryId] = qryName
+                
+                # We need a queryName to continue
+                unless qryName then throw new Error "Have no query name for qryId: #{qryId}"
 
-                return promise.then (qryResult) =>
+                # If there is an existing query check that it matches the one passed in
+                existingQry = if existing.qry then JSON.parse existing.qry else null
+
+                if existingQry? and not qryIdData.qryIdToQryMap[qryId]?
+                    qryIdData.qryIdToQryMap[qryId] = existingQry
+                else if existingQry? and qryIdData.qryIdToQryMap[qryId]?
+                    # Check that the two match
+                    if existing.qry isnt JSON.stringify(qryIdData.qryIdToQryMap[qryId])
+                        throw new Error "Got two separate queries for qryId: #{qryId}\nExisting: #{utils.inspect existingQry}\nOriginal: #{utils.inspect qryIdData.qryIdToQryMap[qryId]}"
+                return
+            return
+
+        _setQuerySession: (ids, externalProps, existingObjs) ->
+            # We only allow the setting of query sessions from the existing one 
+            # if there is a single queryId request
+            if ids.length is 1
+                externalProps.session = if existingObjs[0]?.session then  JSON.parse existingObjs[0].session else {}
+            else
+                externalProps.session = {}
+
+        _runMiddleware: (externalProps, qryData) ->
+            mwPromises = []
+            middleware = []
+            middleware.push globalMiddleware..., @middleware...
+            middleware.forEach (mw) ->
+                mwPromises.push Q.nfcall mw, externalProps, qryData
+
+            # Now run through all the middleware
+            return Q.all mwPromises
+
+        # The queryIds must come in the same order as the results will...
+        _handleOutstandingResultResponse: (qryIds, resultObj) ->
+            return (results) ->
+                unless Array.isArray qryIds
+                    results = [results]
+                    qryIds = [qryIds]
+
+                results.forEach (result, index) ->
+                    resultObj[qryIds[index]] = result
+
+                return Q.resolve()
+
+        _fetchOutstandingResults: (externalProps, qryIdData) ->
+            # We need to get any query that we don't already
+            # have a result for.
+            outstandingQueries = _.reject qryIdData.allIds, (qryId) ->
+                return qryIdData.qryIdToResultMap[qryId]?
+
+            # Now work out which handlers we need
+            if outstandingQueries.length > 0
+                data = {}
+                for qryId in outstandingQueries
+                    qryName = qryIdData.qryIdToNameMap[qryId]
+                    data[qryName] or= []
+                    data[qryName].push qryId
+                handlerData = @_getHandlersForQryIds data
+
+                promises = []
+                handlerData.handlers.forEach (handler, index) =>
+                    qryIds = handlerData.qryIdsMap[index]
+                    # Now we break the query out. If we have more than
+                    # one construct an array. If we don't then keep as an
+                    # individual
+                    if qryIds.length is 1
+                        qryId = qryIds[0]
+                        _prom = Q.nfcall handler, externalProps, qryIdData.qryIdToQryMap[qryId]
+                        _prom = _prom.then @_handleOutstandingResultResponse qryId, qryIdData.qryIdToResultMap
+                        promises.push _prom
+                    else if qryIds.length > 1
+                        queries = []
+                        for qryId in qryIds
+                            queries.push qryIdData.qryIdToQryMap[qryId]
+
+                        _prom = Q.nfcall handler, externalProps, queries
+                        _prom = _prom.then @_handleOutstandingResultResponse qryIds, qryIdData.qryIdToResultMap
+                        promises.push _prom
+                promise = Q.all promises
+            else
+                promise = Q.resolve()
+
+            return promise
+
+        _storeResults: (qryIdData, version, session, socketId, haveOrigQry) ->
+            # Now map each to an individual query
+            promises = []
+            _.each qryIdData.qryIdToResultMap, (qryResult, qryId) =>
+                qryName = qryIdData.qryIdToNameMap[qryId]
+
+                if version?
+                    promise = Q.resolve version
+                else
+                    promise = Q.ninvoke redisClient, 'get', @latestQueryVersionKey
+
+                promise = promise.then (_version) =>
+
+                    # Store the query in redis (if it exists)
+                    qryData = {
+                        result: JSON.stringify qryResult
+                        qryName: qryName
+                        qry: JSON.stringify qryIdData.qryIdToQryMap[qryId]
+                        version: String _version
+                        session: JSON.stringify session
+                    }
+                    qryIdKey =  @qryIdKeyPref + qryId
+                    promise = Q.ninvoke redisClient, 'hmset', qryIdKey, qryData
+
+                    # If this is no TTL on this query then add one. Do this completely async since
+                    # it shouldn't hold up getting the data out to the user
+                    redisClient.ttl qryIdKey, (err, ttl) ->
+                        if err then return winston.error err.stack, err
+                        # If no timeout set or we've been passed in an original query then set an expires
+                        # (the ttl check is more there as safety since the only way the ttl shouldnt exist
+                        # is if we have an original query anyway)
+                        if ttl is -1 or haveOrigQry
+                            # -1 indicates no timeout set. So set one to 2.5 times the heartbeat interval
+                            # (which is the interval that we check )
+                            redisClient.pexpire qryIdKey, 2.5 * heartbeatInterval
+
+                    promise = promise.then => 
+                        promiseA = Q.ninvoke redisClient, 'sadd', @qryNameListKeyPref + qryName, qryId
+
+                        # Store off the link from the socketId to the query...
+                        if socketId
+                            socketIdKey = @socketIdKeyPref + socketId
+                            sockData = JSON.stringify {qryId: qryId, qryName: qryName}
+                            promiseB = Q.ninvoke redisClient, 'sadd', socketIdKey, sockData
+
+                            # Maybe set the ttl on the socketId key. Same as for the qryId key above
+                            redisClient.ttl socketIdKey, (err, ttl) ->
+                                if err then return winston.error err.stack, err
+                                if ttl is -1 then redisClient.pexpire socketIdKey, 2.5 * heartbeatInterval
+                                return
+                        else
+                            promiseB = Q.resolve()
+
+                        return Q.all [promiseA, promiseB]
+                    return promise
+                promises.push promise
+            return Q.all promises
+
+        _createResultObject: (results, existingResults) ->
+            resultObj = {}
+            for qryId, result of results
+                existing = existingResults[qryId]
+                modified = JSON.stringify(result) isnt JSON.stringify(existing)
+                resultObj[qryId] = {
+                    result
+                    modified
+                }
+            return resultObj
+
+
+        runQuery: (qry, externalProps, callback) ->
+
+            unless callback?
+                callback = externalProps
+                externalProps = {}
+
+            # Initialize our parameters
+            @_initializeQueryProps qry, externalProps
+            
+            # Find existing queries from all the ids we want
+            qrypromise = @_findExistingQueries qry.qryIdData.allIds
+
+            qrypromise = qrypromise.then (existingObjs) =>
+
+                # Take the existing queries and construct the query data (or check that the query
+                # data matches the existing data)
+                @_buildAndCheckQueryFromExisting qry.qryIdData, existingObjs, qry.version
+
+                @_setQuerySession qry.qryIdData.allIds, externalProps, existingObjs
+                
+                mwpromise = @_runMiddleware externalProps, qry.qryData
+                
+                # Go and fetch any otstanding results
+                promise = mwpromise.then =>
+                    return @_fetchOutstandingResults externalProps, qry.qryIdData
+
+                return promise.then (qryResults) =>
                     # If we've been passed in a version then use that, otherwise
                     # get the latest version and use that
-                    if qryResult
-                        qry.result = qryResult
-                        if qry.version?
-                            promise = Q.resolve qry.version
-                        else
-                            promise = Q.ninvoke redisClient, 'get', @latestQueryVersionKey
-                        promise = promise.then (_version) =>
-                            qry.version = _version
-                            # Store the query in redis (if it exists)
-                            qryData = {
-                                result: JSON.stringify qry.result
-                                qryName: qry.qryName
-                                qry: JSON.stringify qry.qry
-                                version: String _version
-                                session: JSON.stringify qry.session
-                            }
-                            qryIdKey =  @qryIdKeyPref + qry.qryId
-                            promise = Q.ninvoke redisClient, 'hmset', qryIdKey, qryData
+                    haveOrigQry = qry.qryData?
+                    promise = @_storeResults qry.qryIdData, 
+                                             qry.version, 
+                                             externalProps.session, 
+                                             externalProps.socketId, 
+                                             haveOrigQry
 
-                            # If this is no TTL on this query then add one. Do this completely async since
-                            # it shouldn't hold up getting the data out to the user
-                            redisClient.ttl qryIdKey, (err, ttl) ->
-                                if err then return winston.error err.stack, err
-                                # If no timeout set or we've been passed in an original query then set an expires
-                                # (the ttl check is more there as safety since the only way the ttl shouldnt exist
-                                # is if we have an original query anyway)
-                                if ttl is -1 or haveOrigQry
-                                    # -1 indicates no timeout set. So set one to 2.5 times the heartbeat interval
-                                    # (which is the interval that we check )
-                                    redisClient.pexpire qryIdKey, 2.5 * heartbeatInterval
-
-                            promise = promise.then => 
-                                promiseA = Q.ninvoke redisClient, 'sadd', @qryNameListKeyPref + qry.qryName, qry.qryId
-
-                                # Store off the link from the socketId to the query...
-                                if qry.socketId
-                                    socketIdKey = @socketIdKeyPref + qry.socketId
-                                    sockData = JSON.stringify {qryId: qry.qryId, qryName: qry.qryName}
-                                    promiseB = Q.ninvoke redisClient, 'sadd', socketIdKey, sockData
-
-                                    # Maybe set the ttl on the socketId key. Same as for the qryId key above
-                                    redisClient.ttl socketIdKey, (err, ttl) ->
-                                        if err then return winston.error err.stack, err
-                                        if ttl is -1 then redisClient.pexpire socketIdKey, 2.5 * heartbeatInterval
-                                        return
-                                else
-                                    promiseB = Q.resolve()
-
-                                return Q.all [promiseA, promiseB]
-
-                            return promise
-                    else
-                        promise = Q.resolve()
-
-                    return promise.then ->
-                        # Return the response to the client
-                        modified = qryResult != existingQry
-                        qry.modified = modified
-                        return callback null, qry
+                    return promise.then =>
+                        resultObj = @_createResultObject qry.qryIdData.qryIdToResultMap,
+                                                         qry.qryIdData.qryIdToExistingResultMap
+                        return callback null, resultObj
 
             # Handle the error
             qrypromise.fail (err) ->
